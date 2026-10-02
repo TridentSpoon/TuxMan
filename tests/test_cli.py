@@ -45,9 +45,9 @@ def test_requires_entrypoint_when_ambiguous(tmp_path: Path) -> None:
 
 
 def test_rejects_unknown_package_type(tmp_path: Path) -> None:
-    package = tmp_path / "thing.zip"
+    package = tmp_path / "thing.rar"
     package.write_bytes(b"not a package")
-    with pytest.raises(ConversionError, match="supported package types"):
+    with pytest.raises(ConversionError, match="supported formats"):
         convert(package, tmp_path / "out", None, False)
 
 
