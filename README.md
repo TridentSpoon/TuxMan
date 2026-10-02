@@ -28,7 +28,7 @@ Python 3.10 or newer is required. RPM inputs additionally require `rpm2cpio` and
 
 ```sh
 python -m pip install .
-tuxman vendor-package.deb --entrypoint usr/bin/vendor-app
+tuxman vendor-package.deb --entrypoint usr/bin/vendor-app --appdir
 ./vendor-package.AppDir/AppRun
 ```
 
@@ -36,7 +36,7 @@ If exactly one executable exists under `usr/bin`, `usr/local/bin`, or `bin`, Tux
 selects it automatically. Otherwise, pass its package-relative path explicitly:
 
 ```sh
-tuxman package.rpm -o MyApp.AppDir -e usr/bin/my-app
+tuxman package.rpm -o MyApp.AppDir -e usr/bin/my-app --appdir
 ```
 
 To build an AppImage, install `appimagetool` and run:
@@ -129,8 +129,8 @@ packaged desktop metadata and `appimagetool`.
 
 ## Conversion tool installation
 
-The Conversion tools section checks appimagetool, rpm2cpio, cpio, zstd, and
-7z/7zz on startup and with **Check again**. **Install missing tools** shows
+The **Dependencies** window in the top menu checks appimagetool, rpm2cpio, cpio, zstd, and
+7z/7zz on startup and with **Check again**. Each missing tool’s **Click here to install** button shows
 the proposed package-manager command before starting. System packages are
 installed using a graphical polkit password prompt on Arch/CachyOS, Debian/Ubuntu,
 Fedora/RHEL, and openSUSE families. Other distros receive manual-install guidance.
@@ -142,3 +142,26 @@ installed under `~/.local/share/tuxman/tools` with a launcher in `~/.local/bin`.
 Its launcher uses extract-and-run mode so generating images does not require FUSE.
 Installation runs in the background; tools are checked again afterwards.
 No packages are installed or downloads started until you confirm Install.
+
+Executable discovery first reads visible packaged desktop launchers under
+`usr/share/applications`, including absolute paths such as
+`/usr/share/cursor/cursor` or `/opt/app/app`. Paths are resolved inside the
+bundle, never against installed host applications. Hidden URL handlers are
+ignored. Multiple distinct launchers require an explicit executable choice.
+
+## Shell scripts and default output
+
+AppImage is now the default in the desktop app and CLI. Choose AppDir in the
+output selector or pass `--appdir` for an unpacked bundle.
+
+Standalone `.sh` files are supported. TuxMan copies the script, makes it
+executable, and generates desktop metadata and an icon. Scripts without a
+shebang receive `#!/bin/sh`; existing shebangs are preserved. Conversion never
+runs the script. Launching the resulting bundle runs it normally, including
+any installation actions the original script contains. Script interpreters,
+external commands, companion files, and downloaded resources are not bundled
+or installed automatically, so select a self-contained script.
+
+Open **☰ → Dependencies** to check tools. Installed tools show a green tick;
+missing tools show a red cross and **Click here to install**. The **Check**
+button refreshes the list, and installation checks it again automatically.

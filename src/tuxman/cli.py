@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import configparser
 import os
 import posixpath
 import shutil
@@ -15,7 +16,7 @@ from pathlib import Path, PurePosixPath
 
 
 TAR_SUFFIXES = (".pkg.tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".tar")
-SUPPORTED_SUFFIXES = TAR_SUFFIXES + (".deb", ".rpm", ".zip", ".7z")
+SUPPORTED_SUFFIXES = TAR_SUFFIXES + (".deb", ".rpm", ".zip", ".7z", ".sh")
 
 
 def required_tools(package: Path) -> list[str]:
@@ -179,9 +180,32 @@ def _extract_zstd(package: Path, destination: Path) -> None:
         _safe_extract_tar(Path(decompressed.name), destination)
 
 
+def _extract_script(package: Path, destination: Path) -> None:
+    """Package a standalone script without executing it."""
+    script_dir = destination / "usr/bin"
+    script_dir.mkdir(parents=True, exist_ok=True)
+    target = script_dir / package.name
+    content = package.read_bytes()
+    if b"\x00" in content:
+        raise ConversionError("The .sh input contains binary data; choose a shell script")
+    if not content.startswith(b"#!"):
+        content = b"#!/bin/sh\n" + content
+    target.write_bytes(content)
+    target.chmod(0o755)
+    desktop = destination / "usr/share/applications/tuxman-script.desktop"
+    desktop.parent.mkdir(parents=True, exist_ok=True)
+    desktop.write_text("[Desktop Entry]\nType=Application\nName=" + package.stem.replace("\n", " ").replace("\r", " ") +
+                       "\nExec=AppRun\nIcon=tuxman-script\nTerminal=true\nCategories=Utility;\n")
+    icon = destination / "usr/share/pixmaps/tuxman-script.png"
+    icon.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(Path(__file__).parent / "assets/io.github.TridentSpoon.TuxMan.png", icon)
+
+
 def extract_package(package: Path, destination: Path) -> None:
     suffix = package.suffix.lower()
-    if suffix == ".deb":
+    if suffix == ".sh":
+        _extract_script(package, destination)
+    elif suffix == ".deb":
         _extract_deb(package, destination)
     elif suffix == ".rpm":
         _extract_rpm(package, destination)
@@ -197,6 +221,39 @@ def extract_package(package: Path, destination: Path) -> None:
         raise ConversionError("supported formats: " + ", ".join(SUPPORTED_SUFFIXES))
 
 
+def _desktop_entrypoints(root: Path) -> list[Path]:
+    """Resolve visible app launchers inside the payload, never on the host."""
+    candidates = []
+    for desktop in sorted((root / "usr/share/applications").glob("*.desktop")):
+        config = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            config.read_string(desktop.read_text())
+            section = config["Desktop Entry"]
+            if section.get("Type", "Application") != "Application":
+                continue
+            if section.get("Hidden", "false").lower() == "true" or section.get("NoDisplay", "false").lower() == "true":
+                continue
+            words = shlex.split(section.get("Exec", ""))
+        except (configparser.Error, KeyError, UnicodeError, ValueError):
+            continue
+        if not words:
+            continue
+        executable = words[0]
+        if executable.startswith("/"):
+            paths = [root / executable.lstrip("/")]
+        elif "/" not in executable:
+            paths = [root / folder / executable for folder in ("usr/bin", "usr/local/bin", "bin")]
+        else:
+            paths = [root / executable]
+        for path in paths:
+            resolved = path.resolve()
+            if root.resolve() in resolved.parents and path.is_file() and os.access(path, os.X_OK):
+                if path not in candidates:
+                    candidates.append(path)
+                break
+    return candidates
+
+
 def _entrypoint(root: Path, requested: str | None, archive: bool = False) -> str:
     if requested:
         candidate = requested.lstrip("/")
@@ -206,7 +263,12 @@ def _entrypoint(root: Path, requested: str | None, archive: bool = False) -> str
         if not resolved.is_file():
             raise ConversionError(f"entrypoint not found in package: {requested}")
         return candidate
-    candidates: list[Path] = []
+    candidates = _desktop_entrypoints(root)
+    if candidates:
+        if len(candidates) == 1:
+            return str(candidates[0].relative_to(root))
+        names = ", ".join(str(path.relative_to(root)) for path in candidates)
+        raise ConversionError(f"multiple application launchers ({names}); set the Executable path field or use --entrypoint")
     for folder in ("usr/bin", "usr/local/bin", "bin"):
         directory = root / folder
         if directory.is_dir():
@@ -225,7 +287,7 @@ def _entrypoint(root: Path, requested: str | None, archive: bool = False) -> str
                                   if p.is_file() and os.access(p, os.X_OK))
     if len(candidates) != 1:
         names = ", ".join(str(p.relative_to(root)) for p in candidates) or "none"
-        raise ConversionError(f"cannot choose an entrypoint ({names}); pass --entrypoint")
+        raise ConversionError(f"cannot choose an entrypoint ({names}); set the Executable path field or use --entrypoint")
     return str(candidates[0].relative_to(root))
 
 
@@ -249,22 +311,45 @@ def _link_appimage_metadata(appdir: Path) -> None:
     desktops = sorted(desktop_dir.glob("*.desktop")) if desktop_dir.is_dir() else []
     if not desktops:
         raise ConversionError("AppImage creation requires a packaged .desktop file")
-    desktop = desktops[0]
-    (appdir / desktop.name).symlink_to(desktop.relative_to(appdir))
-
+    visible = []
+    for candidate in desktops:
+        config = configparser.ConfigParser(interpolation=None, strict=False)
+        try:
+            config.read_string(candidate.read_text())
+            entry = config["Desktop Entry"]
+            if entry.get("Hidden", "false").lower() != "true" and entry.get("NoDisplay", "false").lower() != "true":
+                visible.append(candidate)
+        except (configparser.Error, KeyError, UnicodeError):
+            continue
+    desktop = (visible or desktops)[0]
+    # AppImage desktop integration must call the relocatable launcher.
+    content = desktop.read_text(errors="replace")
+    lines = []
+    main_section = False
     icon_name = ""
-    for line in desktop.read_text(errors="replace").splitlines():
-        if line.startswith("Icon="):
+    for line in content.splitlines():
+        if line.startswith("["):
+            main_section = line == "[Desktop Entry]"
+        if main_section and line.startswith("Icon="):
             icon_name = line.partition("=")[2].strip()
-            break
+        if line.startswith("Exec="):
+            words = shlex.split(line.partition("=")[2])
+            args = " ".join(words[1:])
+            line = "Exec=AppRun" + (" " + args if args else "")
+        lines.append(line)
+    (appdir / desktop.name).write_text("\n".join(lines) + "\n")
     if not icon_name or "/" in icon_name:
-        return
-    icon_root = appdir / "usr/share/icons"
-    icons = sorted(icon_root.glob(f"**/{icon_name}.*")) if icon_root.is_dir() else []
-    icons = [p for p in icons if p.suffix.lower() in {".png", ".svg", ".xpm"}]
-    if icons:
-        icon = icons[-1]
-        (appdir / f"{icon_name}{icon.suffix}").symlink_to(icon.relative_to(appdir))
+        raise ConversionError("AppImage creation requires a named packaged icon in the desktop launcher")
+    icons = []
+    for folder in ("usr/share/icons", "usr/share/pixmaps"):
+        directory = appdir / folder
+        if directory.is_dir():
+            icons.extend(p for p in directory.rglob("*")
+                         if p.is_file() and p.name in {icon_name + ext for ext in (".png", ".svg", ".xpm")})
+    if not icons:
+        raise ConversionError(f"AppImage icon not found in package: {icon_name}")
+    icon = sorted(icons)[-1]
+    (appdir / f"{icon_name}{icon.suffix}").symlink_to(icon.relative_to(appdir))
 
 
 def convert(package: Path, output: Path, entrypoint: str | None, appimage: bool) -> Path:
@@ -283,7 +368,14 @@ def convert(package: Path, output: Path, entrypoint: str | None, appimage: bool)
                 raise ConversionError("--appimage requires appimagetool on PATH")
             _link_appimage_metadata(output)
             image = output.with_suffix(".AppImage")
-            subprocess.run([tool, str(output), str(image)], check=True)
+            environment = os.environ.copy()
+            if package.suffix.lower() == ".sh":
+                from .dependencies import architecture
+                environment["ARCH"] = architecture()
+            result = subprocess.run([tool, str(output), str(image)], capture_output=True, text=True, env=environment)
+            if result.returncode:
+                details = (result.stderr + "\n" + result.stdout).strip()
+                raise ConversionError("appimagetool failed:\n" + (details[-6000:] or f"exit status {result.returncode}"))
             return image
         return output
     except Exception:
@@ -304,7 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("package", type=Path, help="input package/archive (" + ", ".join(SUPPORTED_SUFFIXES) + ")")
     parser.add_argument("-o", "--output", type=Path, help="output AppDir (default: NAME.AppDir)")
     parser.add_argument("-e", "--entrypoint", help="executable path inside the package")
-    parser.add_argument("--appimage", action="store_true", help="also run appimagetool")
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument("--appimage", dest="appimage", action="store_true", help="create an AppImage (default)")
+    formats.add_argument("--appdir", dest="appimage", action="store_false", help="create only an AppDir")
+    parser.set_defaults(appimage=True)
     return parser
 
 

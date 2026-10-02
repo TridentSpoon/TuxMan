@@ -24,7 +24,11 @@ class Window(Adw.ApplicationWindow):
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
         menu = Gio.Menu()
+        menu.append("Dependencies", "win.dependencies")
         menu.append("About TuxMan", "win.about")
+        deps_action = Gio.SimpleAction.new("dependencies", None)
+        deps_action.connect("activate", lambda *_: DependenciesWindow(self).present() if not self.busy else None)
+        self.add_action(deps_action)
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu))
         about = Gio.SimpleAction.new("about", None)
         about.connect("activate", lambda *_: AboutWindow(self).present())
@@ -62,32 +66,13 @@ class Window(Adw.ApplicationWindow):
         self.settings.add(self.name)
         self.format = Adw.ComboRow(title="Output format",
             model=Gtk.StringList.new(["AppDir", "AppImage"]))
+        self.format.set_selected(1)
         self.settings.add(self.format)
         self.entry = Adw.EntryRow(title="Executable path (optional, e.g. usr/bin/my-app)")
         self.settings.add(self.entry)
-        box.append(Gtk.Label(label="The executable is chosen automatically when the package contains one candidate. "
-            "AppImages require appimagetool; RPM requires rpm2cpio and cpio; .zst requires zstd; .7z requires 7z or 7zz. "
-            "External dependencies, services and incompatible binaries can prevent an app from running on another distro.",
+        box.append(Gtk.Label(label="The executable is chosen automatically. Check conversion tools in the Dependencies menu. "
+            "Shell scripts need their interpreter and external commands on the destination system.",
             xalign=0, wrap=True))
-        self.dependency_group = Adw.PreferencesGroup(title="Conversion tools")
-        box.append(self.dependency_group)
-        self.dependency_rows = {}
-        for tool in dependencies.TOOLS:
-            row = Adw.ActionRow(title=tool.label)
-            row.set_use_markup(False)
-            self.dependency_rows[tool.key] = row
-            self.dependency_group.add(row)
-        dependency_actions = Gtk.Box(spacing=12)
-        self.recheck = Gtk.Button(label="Check again")
-        self.recheck.connect("clicked", self.check_dependencies)
-        dependency_actions.append(self.recheck)
-        self.install_tools = Gtk.Button(label="Install missing tools")
-        self.install_tools.connect("clicked", self.confirm_install)
-        dependency_actions.append(self.install_tools)
-        self.dependency_group.add(dependency_actions)
-        self.dependency_message = Gtk.Label(xalign=0, wrap=True, selectable=True)
-        self.dependency_group.add(self.dependency_message)
-        self.check_dependencies()
         actions = Gtk.Box(spacing=12)
         self.start = Gtk.Button(label="Create bundle", sensitive=False)
         self.start.add_css_class("suggested-action")
@@ -102,72 +87,6 @@ class Window(Adw.ApplicationWindow):
         self.open.connect("clicked", self.open_output)
         box.append(self.open)
         self.connect("close-request", self.on_close)
-
-    def check_dependencies(self, *_):
-        self.missing_tools = []
-        for tool in dependencies.TOOLS:
-            present = tool.present()
-            self.dependency_rows[tool.key].set_subtitle(
-                ("Installed · " if present else "Missing · ") + tool.purpose)
-            if not present:
-                self.missing_tools.append(tool)
-        self.install_tools.set_sensitive(bool(self.missing_tools))
-        self.dependency_message.set_text("All conversion tools are available." if not self.missing_tools
-                                         else "Install missing tools to enable their formats.")
-
-    def confirm_install(self, *_):
-        self.check_dependencies()
-        tools = list(self.missing_tools)
-        if not tools:
-            return
-        try:
-            command = dependencies.install_command(dependencies.family(), tools)
-            if any(tool.key == "appimagetool" for tool in tools):
-                dependencies.architecture()
-        except (ValueError, OSError) as exc:
-            self.dependency_message.set_text(str(exc))
-            return
-        description = ""
-        if command:
-            description += "Install distro packages using a graphical password prompt:\n" + shlex.join(command)
-        if any(tool.key == "appimagetool" for tool in tools):
-            description += "\n\nDownload appimagetool from its official GitHub release, verify SHA-256, and install it in your user folder."
-        dialog = Adw.MessageDialog(transient_for=self, heading="Install missing tools?", body=description.strip())
-        dialog.add_response("cancel", "Cancel")
-        dialog.add_response("install", "Install")
-        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
-        dialog.set_close_response("cancel")
-        dialog.connect("response", lambda dialog, response: self.begin_install(tools, command) if response == "install" else None)
-        dialog.present()
-
-    def begin_install(self, tools, command):
-        self.busy = True
-        self.dependency_group.set_sensitive(False)
-        self.settings.set_sensitive(False)
-        self.start.set_sensitive(False)
-        self.spinner.start()
-        self.dependency_message.set_text("Installing tools… Complete the password prompt if requested.")
-        def work():
-            try:
-                dependencies.install(tools, command)
-            except Exception as exc:
-                GLib.idle_add(self.install_finished, str(exc))
-            else:
-                GLib.idle_add(self.install_finished, None)
-        threading.Thread(target=work, daemon=True).start()
-
-    def install_finished(self, error):
-        self.busy = False
-        self.spinner.stop()
-        self.dependency_group.set_sensitive(True)
-        self.settings.set_sensitive(True)
-        self.start.set_sensitive(self.package is not None)
-        self.check_dependencies()
-        if error:
-            self.dependency_message.set_text("Installation failed: " + error)
-        elif self.missing_tools:
-            self.dependency_message.set_text("Installation finished, but some tools are still missing. Check the statuses above.")
-        return GLib.SOURCE_REMOVE
 
     def choose_package(self, *_):
         dialog = Gtk.FileChooserNative(title="Choose a package", transient_for=self,
@@ -187,7 +106,8 @@ class Window(Adw.ApplicationWindow):
             self.name.set_text(package_name(self.package))
             self.start.set_sensitive(True)
             self.open.set_visible(False)
-            self.status.set_text("Ready to create a bundle.")
+            self.status.set_text("The script will be packaged without running it. It will run when you launch the bundle."
+                                 if self.package.suffix.lower() == ".sh" else "Ready to create a bundle.")
         dialog.destroy()
 
     def choose_destination(self, *_):
@@ -213,7 +133,7 @@ class Window(Adw.ApplicationWindow):
             needed.append("appimagetool")
         missing = [tool for tool in needed if tool == "7z or 7zz" or not shutil.which(tool)]
         if missing:
-            self.status.set_text("Install these tools first: " + ", ".join(missing))
+            self.status.set_text("Open Dependencies in the top menu to install: " + ", ".join(missing))
             return
         output = self.destination / (name + ".AppDir")
         if output.exists() or (appimage and output.with_suffix(".AppImage").exists()):
@@ -221,7 +141,6 @@ class Window(Adw.ApplicationWindow):
             return
         entrypoint = self.entry.get_text().strip() or None
         self.busy = True
-        self.dependency_group.set_sensitive(False)
         self.settings.set_sensitive(False)
         self.start.set_sensitive(False)
         self.open.set_visible(False)
@@ -240,7 +159,6 @@ class Window(Adw.ApplicationWindow):
     def finished(self, result, error):
         self.busy = False
         self.spinner.stop()
-        self.dependency_group.set_sensitive(True)
         self.settings.set_sensitive(True)
         self.start.set_sensitive(True)
         self.result = result
@@ -258,6 +176,121 @@ class Window(Adw.ApplicationWindow):
         if self.busy:
             self.status.set_text("Please wait for the current operation to finish before closing.")
         return self.busy
+
+
+class DependenciesWindow(Adw.Window):
+    def __init__(self, parent):
+        super().__init__(title="Dependencies", transient_for=parent, modal=True,
+                         default_width=500, default_height=440)
+        self.parent_window = parent
+        self.busy = False
+        view = Adw.ToolbarView()
+        header = Adw.HeaderBar()
+        self.recheck = Gtk.Button(label="Check")
+        self.recheck.connect("clicked", self.check_dependencies)
+        header.pack_start(self.recheck)
+        self.spinner = Gtk.Spinner()
+        header.pack_end(self.spinner)
+        view.add_top_bar(header)
+        self.set_content(view)
+        page = Adw.PreferencesPage()
+        view.set_content(page)
+        self.dependency_group = Adw.PreferencesGroup(title="Conversion dependencies")
+        page.add(self.dependency_group)
+        self.dependency_rows = {}
+        self.dependency_icons = {}
+        self.install_buttons = {}
+        for tool in dependencies.TOOLS:
+            row = Adw.ActionRow(title=tool.label)
+            row.set_use_markup(False)
+            status = Gtk.Label()
+            status.add_css_class("title-2")
+            row.add_prefix(status)
+            button = Gtk.Button(label="Click here to install", valign=Gtk.Align.CENTER)
+            button.connect("clicked", lambda *_, item=tool: self.confirm_install(tool=item))
+            row.add_suffix(button)
+            self.dependency_rows[tool.key] = row
+            self.dependency_icons[tool.key] = status
+            self.install_buttons[tool.key] = button
+            self.dependency_group.add(row)
+        self.dependency_message = Gtk.Label(xalign=0, wrap=True, selectable=True)
+        self.dependency_group.add(self.dependency_message)
+        self.check_dependencies()
+        self.connect("close-request", lambda *_: self.busy)
+
+    def check_dependencies(self, *_):
+        self.missing_tools = []
+        for tool in dependencies.TOOLS:
+            present = tool.present()
+            self.dependency_rows[tool.key].set_subtitle(
+                ("Installed · " if present else "Missing · ") + tool.purpose)
+            if not present:
+                self.missing_tools.append(tool)
+            self.dependency_icons[tool.key].set_text("✓" if present else "✕")
+            self.dependency_icons[tool.key].remove_css_class("error" if present else "success")
+            self.dependency_icons[tool.key].add_css_class("success" if present else "error")
+            self.install_buttons[tool.key].set_visible(not present)
+        self.dependency_message.set_text("All conversion tools are available." if not self.missing_tools
+                                         else "Install missing tools to enable their formats.")
+
+    def confirm_install(self, *_, tool=None):
+        self.check_dependencies()
+        tools = [item for item in self.missing_tools if tool is None or item.key == tool.key]
+        if not tools:
+            return
+        try:
+            command = dependencies.install_command(dependencies.family(), tools)
+            if any(tool.key == "appimagetool" for tool in tools):
+                dependencies.architecture()
+        except (ValueError, OSError) as exc:
+            self.dependency_message.set_text(str(exc))
+            return
+        description = ""
+        if command:
+            description += "Install distro packages using a graphical password prompt:\n" + shlex.join(command)
+        if any(tool.key == "appimagetool" for tool in tools):
+            description += "\n\nDownload appimagetool from its official GitHub release, verify SHA-256, and install it in your user folder."
+        dialog = Adw.MessageDialog(transient_for=self, heading="Install missing tools?", body=description.strip())
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("install", "Install")
+        dialog.set_response_appearance("install", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+        dialog.connect("response", lambda dialog, response: self.begin_install(tools, command) if response == "install" else None)
+        dialog.present()
+
+    def begin_install(self, tools, command):
+        self.recheck.set_sensitive(False)
+        self.busy = True
+        self.parent_window.busy = True
+        self.dependency_group.set_sensitive(False)
+        self.parent_window.settings.set_sensitive(False)
+        self.parent_window.start.set_sensitive(False)
+        self.spinner.start()
+        self.dependency_message.set_text("Installing tools… Complete the password prompt if requested.")
+        def work():
+            try:
+                dependencies.install(tools, command)
+            except Exception as exc:
+                GLib.idle_add(self.install_finished, str(exc))
+            else:
+                GLib.idle_add(self.install_finished, None)
+        threading.Thread(target=work, daemon=True).start()
+
+    def install_finished(self, error):
+        self.recheck.set_sensitive(True)
+        self.busy = False
+        self.parent_window.busy = False
+        self.spinner.stop()
+        self.dependency_group.set_sensitive(True)
+        self.parent_window.settings.set_sensitive(True)
+        self.parent_window.start.set_sensitive(self.parent_window.package is not None)
+        self.check_dependencies()
+        if error:
+            self.dependency_message.set_text("Installation failed: " + error)
+        elif self.missing_tools:
+            self.dependency_message.set_text("Installation finished, but some tools are still missing. Check the statuses above.")
+        return GLib.SOURCE_REMOVE
+
 
 
 class AboutWindow(Adw.Window):
