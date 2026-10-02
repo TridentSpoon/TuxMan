@@ -55,3 +55,32 @@ python -m pip install -e '.[test]'
 pytest
 ```
 
+
+## Desktop app
+
+TuxMan includes a native GTK4/libadwaita interface, following the same toolkit
+as Set the Table and N-Able Tux Control. Choose your package and destination,
+name the bundle, select AppDir or AppImage, and click **Create bundle**.
+Conversion runs in the background. Errors appear in the window; existing
+outputs are preserved. **Open output folder** reveals a successful result.
+The GUI does not launch converted applications automatically.
+
+Install the GUI dependencies:
+
+- Arch/CachyOS: `sudo pacman -S python-gobject gtk4 libadwaita`
+- Debian/Ubuntu: `sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1`
+- Fedora: `sudo dnf install python3-gobject gtk4 libadwaita`
+
+From this checkout, run `./install.sh` to add TuxMan to your application menu.
+Re-run it after updating the checkout. Alternatively, after installing the
+Python package, run `tuxman-gui`, or use `PYTHONPATH=src python3 -m tuxman.gui`
+directly from the checkout. PyGObject comes from your distro; a virtual
+environment must have access to those system packages to run the GUI.
+
+The existing `tuxman` command remains available for terminal workflows.
+
+The header menu includes **About TuxMan**, with the version, full MIT license,
+project link, and a **Check** button for updates. Checks run in the background
+only on request. When a newer GitHub release exists, open its download page
+and run the new checkout’s `install.sh` to update. No automatic installation
+is performed.

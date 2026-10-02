@@ -13,6 +13,7 @@ authors = [{ name = "TuxMan contributors" }]
 
 [project.scripts]
 tuxman = "tuxman.cli:main"
+tuxman-gui = "tuxman.gui:main"
 
 [project.optional-dependencies]
 test = ["pytest>=7"]
@@ -23,3 +24,6 @@ testpaths = ["tests"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+tuxman = ["assets/*.png", "assets/*.txt"]
