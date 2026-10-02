@@ -4,12 +4,29 @@ import argparse
 import os
 import posixpath
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
 import tarfile
 import tempfile
+import zipfile
 from pathlib import Path, PurePosixPath
+
+
+TAR_SUFFIXES = (".pkg.tar.zst", ".tar.gz", ".tar.xz", ".tar.bz2", ".tar.zst", ".tgz", ".tar")
+SUPPORTED_SUFFIXES = TAR_SUFFIXES + (".deb", ".rpm", ".zip", ".7z")
+
+
+def required_tools(package: Path) -> list[str]:
+    name = package.name.lower()
+    if name.endswith(".rpm"):
+        return ["rpm2cpio", "cpio"]
+    if name.endswith(".zst"):
+        return ["zstd"]
+    if name.endswith(".7z"):
+        return [] if shutil.which("7z") or shutil.which("7zz") else ["7z or 7zz"]
+    return []
 
 
 class ConversionError(RuntimeError):
@@ -27,6 +44,8 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
                 target != destination and destination not in target.parents
             ):
                 raise ConversionError(f"unsafe path in package: {member.name}")
+            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise ConversionError(f"unsupported special file in package: {member.name}")
             if member.issym():
                 link = posixpath.normpath(str(member_path.parent / member.linkname))
                 if PurePosixPath(member.linkname).is_absolute() or link == ".." or link.startswith("../"):
@@ -35,7 +54,12 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
                 link = posixpath.normpath(member.linkname)
                 if PurePosixPath(member.linkname).is_absolute() or link == ".." or link.startswith("../"):
                     raise ConversionError(f"unsafe link in package: {member.name}")
-        stream.extractall(destination)
+            if member.islnk():
+                linked = (destination / member.linkname).resolve()
+                if destination not in linked.parents:
+                    raise ConversionError(f"unsafe link in package: {member.name}")
+            # Validate against already extracted links before each write.
+            stream.extract(member, destination, set_attrs=True)
 
 
 def _extract_deb(package: Path, destination: Path) -> None:
@@ -82,20 +106,104 @@ def _extract_rpm(package: Path, destination: Path) -> None:
         raise ConversionError("failed to extract RPM payload")
 
 
+def _archive_target(destination: Path, name: str) -> Path:
+    path = PurePosixPath(name)
+    target = (destination / path).resolve()
+    if path.is_absolute() or ".." in path.parts or "\\" in name or (
+        target != destination.resolve() and destination.resolve() not in target.parents
+    ):
+        raise ConversionError(f"unsafe path in archive: {name}")
+    return target
+
+
+def _extract_zip(package: Path, destination: Path) -> None:
+    with zipfile.ZipFile(package) as archive:
+        for member in archive.infolist():
+            target = _archive_target(destination, member.filename)
+            mode = member.external_attr >> 16
+            kind = stat.S_IFMT(mode)
+            if kind not in (0, stat.S_IFREG, stat.S_IFDIR):
+                raise ConversionError(f"unsupported link or special file: {member.filename}")
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with archive.open(member) as source, target.open("wb") as output:
+                    shutil.copyfileobj(source, output)
+                target.chmod((mode & 0o777) or 0o644)
+
+
+def _extract_7z(package: Path, destination: Path) -> None:
+    tool = shutil.which("7z") or shutil.which("7zz")
+    if not tool:
+        raise ConversionError("7z archives require 7z or 7zz")
+    listing = subprocess.run([tool, "l", "-slt", "--", str(package.resolve())],
+                             capture_output=True, text=True, check=True)
+    if "----------" not in listing.stdout:
+        raise ConversionError("cannot read 7z archive listing")
+    entries = []
+    names = set()
+    for block in listing.stdout.split("----------", 1)[1].strip().split("\n\n"):
+        fields = dict(line.split(" = ", 1) for line in block.splitlines() if " = " in line)
+        name = fields.get("Path")
+        if not name:
+            continue
+        target = _archive_target(destination, name)
+        attributes = fields.get("Attributes", "")
+        if any("Link" in key for key in fields) or "l" in attributes or "L" in attributes:
+            raise ConversionError(f"unsupported link in 7z archive: {name}")
+        if name in names or any(char in name for char in "*?[]"):
+            raise ConversionError(f"ambiguous 7z member: {name}")
+        names.add(name)
+        entries.append((name, target, fields.get("Folder") == "+" or attributes.startswith("D"), attributes))
+    # Stream members to validated files rather than letting 7z write paths or links.
+    for name, target, directory, attributes in entries:
+        if directory:
+            target.mkdir(parents=True, exist_ok=True)
+            continue
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as output:
+            subprocess.run([tool, "x", "-so", "-spd", "--", str(package.resolve()), name],
+                           stdout=output, stderr=subprocess.PIPE, check=True)
+        target.chmod(0o755 if "x" in attributes else 0o644)
+
+
+def _extract_zstd(package: Path, destination: Path) -> None:
+    tool = shutil.which("zstd")
+    if not tool:
+        raise ConversionError("Zstandard archives require zstd")
+    with tempfile.NamedTemporaryFile(suffix=".tar") as decompressed:
+        subprocess.run([tool, "-d", "-q", "-c", "--", str(package)],
+                       stdout=decompressed, stderr=subprocess.PIPE, check=True)
+        decompressed.flush()
+        _safe_extract_tar(Path(decompressed.name), destination)
+
+
 def extract_package(package: Path, destination: Path) -> None:
     suffix = package.suffix.lower()
     if suffix == ".deb":
         _extract_deb(package, destination)
     elif suffix == ".rpm":
         _extract_rpm(package, destination)
+    elif package.name.lower().endswith(".zst"):
+        _extract_zstd(package, destination)
+    elif suffix == ".zip":
+        _extract_zip(package, destination)
+    elif suffix == ".7z":
+        _extract_7z(package, destination)
+    elif package.name.lower().endswith(TAR_SUFFIXES):
+        _safe_extract_tar(package, destination)
     else:
-        raise ConversionError("supported package types are .deb and .rpm")
+        raise ConversionError("supported formats: " + ", ".join(SUPPORTED_SUFFIXES))
 
 
-def _entrypoint(root: Path, requested: str | None) -> str:
+def _entrypoint(root: Path, requested: str | None, archive: bool = False) -> str:
     if requested:
         candidate = requested.lstrip("/")
-        if not (root / candidate).is_file():
+        resolved = (root / candidate).resolve()
+        if root.resolve() not in resolved.parents:
+            raise ConversionError("entrypoint must stay inside the package")
+        if not resolved.is_file():
             raise ConversionError(f"entrypoint not found in package: {requested}")
         return candidate
     candidates: list[Path] = []
@@ -103,6 +211,18 @@ def _entrypoint(root: Path, requested: str | None) -> str:
         directory = root / folder
         if directory.is_dir():
             candidates.extend(p for p in directory.iterdir() if p.is_file() and os.access(p, os.X_OK))
+    if archive and not candidates:
+        # Binary tarballs often contain an executable at the root or in one
+        # enclosing application directory. Leave that layout intact.
+        folders = [root]
+        children = list(root.iterdir())
+        if len(children) == 1 and children[0].is_dir():
+            base = children[0]
+            folders.extend([base, base / "bin", base / "usr/bin"])
+        for folder in folders:
+            if folder.is_dir():
+                candidates.extend(p for p in folder.iterdir()
+                                  if p.is_file() and os.access(p, os.X_OK))
     if len(candidates) != 1:
         names = ", ".join(str(p.relative_to(root)) for p in candidates) or "none"
         raise ConversionError(f"cannot choose an entrypoint ({names}); pass --entrypoint")
@@ -116,7 +236,7 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 export PATH="$HERE/usr/bin:$HERE/usr/sbin:$HERE/bin:${{PATH:-}}"
 export LD_LIBRARY_PATH="$HERE/usr/lib:$HERE/usr/lib64:$HERE/lib:$HERE/lib64:${{LD_LIBRARY_PATH:-}}"
 export XDG_DATA_DIRS="$HERE/usr/share:${{XDG_DATA_DIRS:-/usr/local/share:/usr/share}}"
-exec "$HERE/{entrypoint}" "$@"
+exec "$HERE/"{shlex.quote(entrypoint)} "$@"
 """
     target = appdir / "AppRun"
     target.write_text(script)
@@ -155,7 +275,7 @@ def convert(package: Path, output: Path, entrypoint: str | None, appimage: bool)
     output.mkdir(parents=True)
     try:
         extract_package(package, output)
-        chosen = _entrypoint(output, entrypoint)
+        chosen = _entrypoint(output, entrypoint, package.name.lower().endswith(TAR_SUFFIXES + (".zip", ".7z")))
         _write_apprun(output, chosen)
         if appimage:
             tool = shutil.which("appimagetool")
@@ -171,9 +291,17 @@ def convert(package: Path, output: Path, entrypoint: str | None, appimage: bool)
         raise
 
 
+def package_name(package: Path) -> str:
+    """Remove the full supported archive extension for output naming."""
+    for suffix in SUPPORTED_SUFFIXES:
+        if package.name.lower().endswith(suffix):
+            return package.name[:-len(suffix)]
+    return package.stem
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Convert a DEB or RPM payload into an AppDir")
-    parser.add_argument("package", type=Path, help="input .deb or .rpm package")
+    parser = argparse.ArgumentParser(description="Convert a Linux package or application archive into an AppDir")
+    parser.add_argument("package", type=Path, help="input package/archive (" + ", ".join(SUPPORTED_SUFFIXES) + ")")
     parser.add_argument("-o", "--output", type=Path, help="output AppDir (default: NAME.AppDir)")
     parser.add_argument("-e", "--entrypoint", help="executable path inside the package")
     parser.add_argument("--appimage", action="store_true", help="also run appimagetool")
@@ -182,10 +310,10 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    output = args.output or Path(f"{args.package.stem}.AppDir")
+    output = args.output or Path(f"{package_name(args.package)}.AppDir")
     try:
         result = convert(args.package, output, args.entrypoint, args.appimage)
-    except (ConversionError, OSError, subprocess.SubprocessError) as exc:
+    except (ConversionError, OSError, subprocess.SubprocessError, tarfile.TarError, zipfile.BadZipFile) as exc:
         print(f"tuxman: error: {exc}", file=sys.stderr)
         return 1
     print(result)

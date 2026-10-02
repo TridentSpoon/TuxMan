@@ -1,7 +1,7 @@
 # TuxMan
 
 TuxMan extracts the application payload from a Debian (`.deb`) or RPM (`.rpm`)
-package and arranges it as an [AppDir](https://docs.appimage.org/reference/appdir.html).
+package or tar archive (`.tar`, `.tar.gz`) and arranges it as an [AppDir](https://docs.appimage.org/reference/appdir.html).
 It can optionally invoke `appimagetool` to produce an AppImage.
 
 ## Is universal package conversion possible?
@@ -84,3 +84,61 @@ project link, and a **Check** button for updates. Checks run in the background
 only on request. When a newer GitHub release exists, open its download page
 and run the new checkout’s `install.sh` to update. No automatic installation
 is performed.
+
+## Tar archives
+
+Select `.tar` or `.tar.gz` in the desktop app, or run:
+
+```sh
+tuxman MyApp.tar.gz
+tuxman MyApp.tar -e MyApp/bin/my-app --appimage
+```
+
+Binary archives can keep their enclosing app folder. TuxMan checks the usual
+`usr/bin`, `usr/local/bin`, and `bin` locations first, then executables at the
+archive root or in a single enclosing folder (including its `bin` and `usr/bin`).
+If there are multiple candidates, enter the executable path relative to the
+archive root. Source archives must be built separately before conversion.
+Tar extraction rejects escaping paths/links and special device files.
+AppImage creation still needs the desktop metadata under
+`usr/share/applications` and appimagetool; tar archives without that metadata
+can be converted to AppDir instead.
+
+## Supported input formats
+
+| Format | Typical use | Requirements |
+| --- | --- | --- |
+| `.deb` | Debian/Ubuntu packages | Python |
+| `.rpm` | Fedora/RHEL/openSUSE packages | `rpm2cpio`, `cpio` |
+| `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.tar.bz2` | Binary or source archives | Python |
+| `.tar.zst` | Zstandard-compressed tar archives | `zstd` |
+| `.pkg.tar.zst` | Arch/CachyOS package payloads | `zstd` |
+| `.zip` | General archives and portable apps | Python |
+| `.7z` | 7-Zip archives | `7z` or `7zz` |
+
+All formats share the AppDir/AppImage workflow and optional executable path.
+ZIP archives preserve stored Unix executable permissions; if those permissions
+are absent, automatic discovery cannot identify the executable. 7z links and
+ambiguous member names are rejected; regular members are streamed into validated
+paths. Extraction does not execute Arch install hooks or compile source code.
+
+These capabilities broaden input support, but do not guarantee compatibility
+on every distro. Missing libraries are not downloaded or bundled automatically,
+and CPU/libc requirements still apply. AppImage output continues to require
+packaged desktop metadata and `appimagetool`.
+
+## Conversion tool installation
+
+The Conversion tools section checks appimagetool, rpm2cpio, cpio, zstd, and
+7z/7zz on startup and with **Check again**. **Install missing tools** shows
+the proposed package-manager command before starting. System packages are
+installed using a graphical polkit password prompt on Arch/CachyOS, Debian/Ubuntu,
+Fedora/RHEL, and openSUSE families. Other distros receive manual-install guidance.
+Package availability depends on the distro release and enabled repositories.
+
+appimagetool is downloaded from the official AppImage/appimagetool release for
+the machine architecture, checked against the release's SHA-256 digest, and
+installed under `~/.local/share/tuxman/tools` with a launcher in `~/.local/bin`.
+Its launcher uses extract-and-run mode so generating images does not require FUSE.
+Installation runs in the background; tools are checked again afterwards.
+No packages are installed or downloads started until you confirm Install.
