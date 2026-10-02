@@ -62,5 +62,5 @@ def test_links_appimage_desktop_and_icon(tmp_path: Path) -> None:
 
     _link_appimage_metadata(appdir)
 
-    assert (appdir / "demo.desktop").resolve() == desktop
+    assert "Icon=demo" in (appdir / "demo.desktop").read_text()
     assert (appdir / "demo.png").resolve() == icon
